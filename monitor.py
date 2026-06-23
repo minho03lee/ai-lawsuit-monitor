@@ -567,8 +567,8 @@ def main():
     if os.getenv("RUN_NOW", "false").lower() == "true":
         run_all()
 
-    schedule.every().day.at("08:00").do(run_all)
-    schedule.every().day.at("20:00").do(run_all)
+    schedule.every().day.at("23:00").do(run_all)
+    schedule.every().day.at("11:00").do(run_all)
 
     while True:
         schedule.run_pending()
