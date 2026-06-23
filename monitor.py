@@ -2,6 +2,7 @@
 AI 학습데이터 소송 모니터링 시스템 - 메인 에이전트
 매일 UTC 23:00, 11:00에 자동 실행 (KST 08:00, 20:00)
 배포 시 환경변수 FIRST_RUN=true로 즉시 실행 가능
+텔레그램 알림에 관련 기사 URL과 발행일 정보 포함
 """
 
 import os
@@ -106,6 +107,7 @@ def init_db():
         summary TEXT,
         status TEXT,
         source_urls TEXT,
+        published_date TEXT,
         raw_snippets TEXT,
         discovered_at TIMESTAMP,
         last_updated TIMESTAMP
@@ -212,9 +214,9 @@ def claude_analyze_snippets(snippets: list[dict], full_texts: dict) -> list[dict
     try:
         client = Anthropic(api_key=ANTHROPIC_API_KEY)
         
-        # 스니펫 형식화
+        # 스니펫 형식화 (URL과 출처 정보 포함)
         snippets_text = "\n".join([
-            f"- {s['title']}\n  {s['snippet']}\n  Source: {s['source']}\n  URL: {s['link']}"
+            f"- {s['title']}\n  {s['snippet']}\n  출처: {s['source']}\n  URL: {s['link']}"
             for s in snippets[:20]
         ])
         
@@ -238,12 +240,14 @@ def claude_analyze_snippets(snippets: list[dict], full_texts: dict) -> list[dict
             "subject_data": "대상 데이터 (예: 저작권 있는 책, 뉴스기사)",
             "claims": "주요 청구 (예: 저작권 침해, GDPR 위반)",
             "summary": "소송 요약 (한두 문장)",
+            "source_urls": "관련 기사 URL들 (쉼표로 구분, 예: https://example.com, https://example2.com)",
+            "published_date": "기사 발행일 (YYYY-MM-DD HH:MM 형식, 예: 2024-06-23 10:30)",
             "confidence": "신뢰도 (high/medium/low)"
         }}
     ]
 }}
 
-JSON만 응답하세요."""
+JSON만 응답하세요. source_urls와 published_date는 스니펫에서 찾을 수 있으면 포함하세요."""
         
         message = client.messages.create(
             model="claude-sonnet-4-6",
@@ -321,57 +325,63 @@ def make_lawsuit_id(plaintiff: str, defendant: str, country: str) -> str:
 
 def notify_new_lawsuit(lawsuit: dict):
     """신규 소송 알림"""
-    # 이메일 알림
-    if EMAIL_FROM and EMAIL_PASSWORD and EMAIL_TO:
-        try:
-            msg = MIMEMultipart("alternative")
-            msg["Subject"] = f"⚖️ 신규 AI 학습데이터 소송 감지: {lawsuit['case_name']}"
-            msg["From"] = EMAIL_FROM
-            msg["To"] = EMAIL_TO
-            
-            html = f"""
-            <html>
-                <body>
-                    <h2>⚖️ 신규 AI 학습데이터 소송 감지</h2>
-                    <table border="1" cellpadding="10">
-                        <tr><td><b>사건명</b></td><td>{lawsuit.get('case_name', 'N/A')}</td></tr>
-                        <tr><td><b>원고</b></td><td>{lawsuit.get('plaintiff', 'N/A')}</td></tr>
-                        <tr><td><b>피고</b></td><td>{lawsuit.get('defendant', 'N/A')}</td></tr>
-                        <tr><td><b>법원</b></td><td>{lawsuit.get('jurisdiction', 'N/A')}</td></tr>
-                        <tr><td><b>제소일</b></td><td>{lawsuit.get('filed_date', 'N/A')}</td></tr>
-                        <tr><td><b>대상 데이터</b></td><td>{lawsuit.get('subject_data', 'N/A')}</td></tr>
-                        <tr><td><b>소송 원인</b></td><td>{lawsuit.get('claims', 'N/A')}</td></tr>
-                        <tr><td><b>요약</b></td><td>{lawsuit.get('summary', 'N/A')}</td></tr>
-                    </table>
-                    <p>출처: {lawsuit.get('source_urls', 'N/A')}</p>
-                </body>
-            </html>
-            """
-            msg.attach(MIMEText(html, "html"))
-            
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-                server.login(EMAIL_FROM, EMAIL_PASSWORD)
-                server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
-            log.info(f"✉️ Email sent for: {lawsuit['case_name']}")
-        except Exception as e:
-            log.error(f"Email notification error: {e}")
+    # 이메일 알림 (비활성화됨 - Render SMTP 제한)
+    # if EMAIL_FROM and EMAIL_PASSWORD and EMAIL_TO:
+    #     try:
+    #         ...
     
     # 텔레그램 알림
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         try:
+            # 소스 URL들 추출
+            source_urls = lawsuit.get('source_urls', '')
+            if isinstance(source_urls, str) and source_urls:
+                source_list = source_urls.split(',')[:3]  # 최대 3개 URL
+                sources_text = "\n".join([f"🔗 {url.strip()}" for url in source_list])
+            else:
+                sources_text = "🔗 출처 정보 없음"
+            
+            # 발행일 정보 추출 (있으면)
+            published_date = lawsuit.get('published_date', '')
+            if published_date:
+                date_info = f"📅 발행일: {published_date}"
+            else:
+                date_info = f"📅 발행일: 미정"
+            
             text = f"""
-⚖️ 신규 AI 학습데이터 소송 감지
+⚖️ <b>신규 AI 학습데이터 소송 감지</b>
 
-사건명: {lawsuit.get('case_name', 'N/A')}
-원고: {lawsuit.get('plaintiff', 'N/A')}
-피고: {lawsuit.get('defendant', 'N/A')}
-법원: {lawsuit.get('jurisdiction', 'N/A')}
-제소일: {lawsuit.get('filed_date', 'N/A')}
+<b>사건명:</b> {lawsuit.get('case_name', 'N/A')}
+<b>원고:</b> {lawsuit.get('plaintiff', 'N/A')}
+<b>피고:</b> {lawsuit.get('defendant', 'N/A')}
+<b>법원:</b> {lawsuit.get('jurisdiction', 'N/A')}
+<b>제소일:</b> {lawsuit.get('filed_date', 'N/A')}
 
-📝 요약: {lawsuit.get('summary', 'N/A')}
+<b>📝 요약:</b>
+{lawsuit.get('summary', 'N/A')}
+
+<b>📚 대상 데이터:</b>
+{lawsuit.get('subject_data', 'N/A')}
+
+<b>⚠️ 청구 사항:</b>
+{lawsuit.get('claims', 'N/A')}
+
+<b>📰 관련 기사:</b>
+{sources_text}
+
+{date_info}
+
+🕐 감지 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S KST')}
             """
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+            requests.post(
+                url, 
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID, 
+                    "text": text,
+                    "parse_mode": "HTML"  # HTML 포맷팅 활성화
+                }
+            )
             log.info(f"📱 Telegram sent for: {lawsuit['case_name']}")
         except Exception as e:
             log.error(f"Telegram notification error: {e}")
@@ -426,8 +436,9 @@ def run_all():
             c.execute("""
                 INSERT INTO lawsuits 
                 (id, case_name, plaintiff, defendant, country, jurisdiction, 
-                 filed_date, subject_data, claims, summary, status, discovered_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                 filed_date, subject_data, claims, summary, status, source_urls, 
+                 published_date, discovered_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             """, (
                 lawsuit_id,
                 lawsuit.get('case_name', ''),
@@ -439,7 +450,9 @@ def run_all():
                 lawsuit.get('subject_data', ''),
                 lawsuit.get('claims', ''),
                 lawsuit.get('summary', ''),
-                'active'
+                'active',
+                lawsuit.get('source_urls', ''),
+                lawsuit.get('published_date', '')
             ))
             new_count += 1
             
