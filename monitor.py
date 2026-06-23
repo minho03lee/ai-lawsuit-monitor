@@ -246,7 +246,7 @@ def claude_analyze_snippets(snippets: list[dict], full_texts: dict) -> list[dict
 JSON만 응답하세요."""
         
         message = client.messages.create(
-            model="claude-sonnet-4-6-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=4000,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -290,7 +290,7 @@ def claude_analyze_update(lawsuit_case: dict) -> Optional[dict]:
 JSON만 응답하세요."""
         
         message = client.messages.create(
-            model="claude-sonnet-4-6-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=1000,
             messages=[{"role": "user", "content": prompt}]
         )
