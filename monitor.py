@@ -1,575 +1,549 @@
-#!/usr/bin/env python3
-"""
-AI Training Data Lawsuit Monitor
-하루 2회 실행: 전세계 AI 학습데이터 관련 소송 모니터링
+"f""
+AI 학습데이터 소송 모니터링 시스템 - 메인 에이전트
+매일 UTC 23:00, 11:00에 자동 실행 (KST 08:00, 20:00)
+배포 시 환경변수 FIRST_RUN=true로 즉시 실행 가능
 """
 
 import os
+import time
 import json
 import sqlite3
-import hashlib
 import logging
-import smtplib
+from datetime import datetime
+from typing import Optional
 import requests
 import schedule
-import time
-from datetime import datetime, timedelta
-from email.mime.multipart import MIMEMultipart
+import smtplib
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from anthropic import Anthropic
-from dotenv import load_dotenv
 
-load_dotenv()
+# ==================== 설정 ====================
+
+# API 키
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+SERPER_API_KEY = os.getenv("SERPER_API_KEY")
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+EMAIL_FROM = os.getenv("EMAIL_FROM")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+EMAIL_TO = os.getenv("EMAIL_TO")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+DB_PATH = os.getenv("DB_PATH", "lawsuits.db")
+
+# 로깅 설정
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("monitor.log"),
-        logging.StreamHandler()
-    ]
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
 log = logging.getLogger(__name__)
 
-# ─── Config ──────────────────────────────────────────────────────────────────
-
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-SERPER_API_KEY    = os.getenv("SERPER_API_KEY")       # https://serper.dev  (Google Search API)
-NEWS_API_KEY      = os.getenv("NEWS_API_KEY")          # https://newsapi.org
-EMAIL_FROM        = os.getenv("EMAIL_FROM")
-EMAIL_PASSWORD    = os.getenv("EMAIL_PASSWORD")
-EMAIL_TO          = os.getenv("EMAIL_TO")              # 쉼표 구분 복수 가능
-TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
-DB_PATH           = os.getenv("DB_PATH", "lawsuits.db")
-
-client = Anthropic(api_key=ANTHROPIC_API_KEY)
-
-# ─── Search Queries (다국어) ──────────────────────────────────────────────────
+# ==================== 30개 다국어 검색 쿼리 ====================
 
 DISCOVERY_QUERIES = [
-    # English – broad
+    # 영어 (일반)
     "AI training data lawsuit filed 2024 2025",
-    "artificial intelligence copyright infringement lawsuit training dataset",
-    "generative AI lawsuit training data complaint filed",
-    "LLM training data scraping lawsuit",
-    "text-to-image model training data lawsuit",
-    # English – jurisdiction
-    "AI training data lawsuit California New York",
-    "OpenAI Anthropic Google Meta training data lawsuit",
-    "Stability AI Midjourney training data copyright lawsuit",
-    # Korean
+    "generative AI lawsuit training dataset copyright",
+    "OpenAI Anthropic Google Meta lawsuit",
+    "Stability AI Midjourney lawsuit",
+    "AI companies sued for training data",
+    
+    # 영어 (저작권/출판)
+    "authors guild AI lawsuit",
+    "publishing companies AI copyright lawsuit",
+    "news organizations AI training data lawsuit",
+    
+    # 미국 (주별)
+    "California AI lawsuit training data",
+    "New York AI regulation lawsuit",
+    "Texas AI lawsuit",
+    
+    # 한국어
     "AI 학습데이터 저작권 소송",
-    "생성형 AI 학습데이터 소송 제기",
-    "인공지능 훈련 데이터 법적 분쟁",
-    # Japanese
+    "생성형 AI 학습데이터 소송",
+    "AI 학습 데이터 저작권 침해 소송",
+    
+    # 일본어
     "AI 学習データ 著作権 訴訟",
-    "生成AI 学習データ 訴訟 提訴",
-    # Chinese
+    "生成型AI 訴訟 学習データ",
+    
+    # 중국어
     "人工智能 训练数据 版权 诉讼",
-    "AI 训练数据 侵权 起诉",
-    # European
-    "AI training data lawsuit Germany France UK EU",
-    "künstliche Intelligenz Trainingsdaten Klage",
-    "intelligence artificielle données entraînement procès",
+    "生成型AI 诉讼",
+    
+    # 유럽
+    "GDPR AI lawsuit training data",
+    "EU AI Act lawsuit",
+    "Germany AI copyright lawsuit",
+    
+    # 기타
+    "AI voice cloning lawsuit",
+    "AI image generation lawsuit",
+    "AI chatbot copyright lawsuit",
+    "machine learning dataset lawsuit",
 ]
 
-UPDATE_QUERIES_TEMPLATE = [
-    '"{plaintiff}" v "{defendant}" AI lawsuit update ruling',
-    '"{case_name}" court ruling decision AI training data',
-    '"{case_name}" settlement dismissed appeal',
-]
-
-TRACKER_SOURCES = [
-    "https://littlesisgoogle.com",           # placeholder
-    "https://www.courtlistener.com",
-    "https://storage.courtlistener.com",
-    "https://www.pacer.gov",
-    "https://www.judiciary.uk",
-]
-
-# ─── Database ────────────────────────────────────────────────────────────────
+# ==================== 데이터베이스 ====================
 
 def init_db():
+    """데이터베이스 초기화"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.executescript("""
-        CREATE TABLE IF NOT EXISTS lawsuits (
-            id              TEXT PRIMARY KEY,
-            discovered_at   TEXT,
-            last_updated    TEXT,
-            status          TEXT DEFAULT 'active',
-            jurisdiction    TEXT,
-            country         TEXT,
-            court           TEXT,
-            case_number     TEXT,
-            case_name       TEXT,
-            plaintiff       TEXT,
-            defendant       TEXT,
-            filed_date      TEXT,
-            subject_data    TEXT,
-            claims          TEXT,
-            summary         TEXT,
-            source_urls     TEXT,
-            raw_snippets    TEXT
-        );
-        CREATE TABLE IF NOT EXISTS updates (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            lawsuit_id  TEXT,
-            updated_at  TEXT,
-            update_type TEXT,
-            description TEXT,
-            source_url  TEXT,
-            FOREIGN KEY (lawsuit_id) REFERENCES lawsuits(id)
-        );
-        CREATE TABLE IF NOT EXISTS search_log (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            searched_at TEXT,
-            query       TEXT,
-            results_cnt INTEGER
-        );
-    """)
-    conn.commit()
-    conn.close()
-    log.info("DB initialised: %s", DB_PATH)
-
-def lawsuit_exists(lawsuit_id: str) -> bool:
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute("SELECT 1 FROM lawsuits WHERE id=?", (lawsuit_id,)).fetchone()
-    conn.close()
-    return row is not None
-
-def save_lawsuit(data: dict):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        INSERT OR REPLACE INTO lawsuits
-        (id, discovered_at, last_updated, status, jurisdiction, country, court,
-         case_number, case_name, plaintiff, defendant, filed_date,
-         subject_data, claims, summary, source_urls, raw_snippets)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (
-        data["id"], data.get("discovered_at", datetime.now().isoformat()),
-        datetime.now().isoformat(), data.get("status", "active"),
-        data.get("jurisdiction"), data.get("country"), data.get("court"),
-        data.get("case_number"), data.get("case_name"),
-        data.get("plaintiff"), data.get("defendant"), data.get("filed_date"),
-        data.get("subject_data"), data.get("claims"), data.get("summary"),
-        json.dumps(data.get("source_urls", []), ensure_ascii=False),
-        json.dumps(data.get("raw_snippets", []), ensure_ascii=False),
-    ))
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS lawsuits (
+        id TEXT PRIMARY KEY,
+        case_name TEXT,
+        plaintiff TEXT,
+        defendant TEXT,
+        country TEXT,
+        court TEXT,
+        jurisdiction TEXT,
+        case_number TEXT,
+        filed_date TEXT,
+        subject_data TEXT,
+        claims TEXT,
+        summary TEXT,
+        status TEXT,
+        source_urls TEXT,
+        raw_snippets TEXT,
+        discovered_at TIMESTAMP,
+        last_updated TIMESTAMP
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS updates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        lawsuit_id TEXT,
+        update_type TEXT,
+        description TEXT,
+        source_url TEXT,
+        updated_at TIMESTAMP,
+        FOREIGN KEY(lawsuit_id) REFERENCES lawsuits(id)
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS search_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        query TEXT,
+        results_cnt INTEGER,
+        searched_at TIMESTAMP
+    )''')
+    
     conn.commit()
     conn.close()
 
-def save_update(lawsuit_id: str, update_type: str, description: str, source_url: str = ""):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        INSERT INTO updates (lawsuit_id, updated_at, update_type, description, source_url)
-        VALUES (?,?,?,?,?)
-    """, (lawsuit_id, datetime.now().isoformat(), update_type, description, source_url))
-    conn.execute("UPDATE lawsuits SET last_updated=? WHERE id=?",
-                 (datetime.now().isoformat(), lawsuit_id))
-    conn.commit()
-    conn.close()
+# ==================== API 호출 ====================
 
-def get_active_lawsuits():
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""
-        SELECT id, case_name, plaintiff, defendant, country, court, status
-        FROM lawsuits WHERE status != 'closed'
-    """).fetchall()
-    conn.close()
-    return [dict(zip(["id","case_name","plaintiff","defendant","country","court","status"], r))
-            for r in rows]
-
-# ─── Search ──────────────────────────────────────────────────────────────────
-
-def serper_search(query: str, num: int = 10, search_type: str = "search") -> list[dict]:
-    """Google Search via Serper.dev"""
-    if not SERPER_API_KEY:
-        log.warning("SERPER_API_KEY not set – skipping Google search")
-        return []
-    url = f"https://google.serper.dev/{search_type}"
-    payload = {"q": query, "num": num, "gl": "us", "hl": "en"}
-    headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
+def serper_search(query: str, max_results: int = 10) -> list[dict]:
+    """Serper.dev를 사용한 Google 검색"""
     try:
-        r = requests.post(url, json=payload, headers=headers, timeout=15)
-        r.raise_for_status()
-        data = r.json()
+        url = "https://google.serper.dev/search"
+        headers = {
+            "X-API-KEY": SERPER_API_KEY,
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "q": query,
+            "num": max_results,
+            "type": "news"
+        }
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        response.raise_for_status()
+        
         results = []
-        for item in data.get("organic", []) + data.get("news", []):
+        data = response.json()
+        
+        # 뉴스 결과
+        for item in data.get("news", [])[:max_results]:
             results.append({
-                "title": item.get("title", ""),
-                "url":   item.get("link", ""),
-                "snippet": item.get("snippet", ""),
-                "date": item.get("date", ""),
+                "title": item.get("title"),
+                "snippet": item.get("snippet"),
+                "link": item.get("link"),
+                "source": item.get("source")
             })
+        
         return results
     except Exception as e:
-        log.error("Serper error [%s]: %s", query, e)
+        log.error(f"Serper search error: {e}")
         return []
 
-def newsapi_search(query: str, days_back: int = 3) -> list[dict]:
-    """NewsAPI.org"""
-    if not NEWS_API_KEY:
-        return []
-    from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-    url = "https://newsapi.org/v2/everything"
-    params = {
-        "q": query, "from": from_date, "sortBy": "publishedAt",
-        "language": "en", "pageSize": 20, "apiKey": NEWS_API_KEY,
-    }
+def newsapi_search(query: str, max_results: int = 10) -> list[dict]:
+    """NewsAPI를 사용한 뉴스 검색"""
     try:
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        articles = r.json().get("articles", [])
-        return [{"title": a["title"], "url": a["url"],
-                 "snippet": a.get("description",""), "date": a.get("publishedAt","")}
-                for a in articles]
+        url = "https://newsapi.org/v2/everything"
+        params = {
+            "q": query,
+            "pageSize": max_results,
+            "sortBy": "publishedAt",
+            "apiKey": NEWS_API_KEY
+        }
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        
+        results = []
+        data = response.json()
+        
+        for article in data.get("articles", [])[:max_results]:
+            results.append({
+                "title": article.get("title"),
+                "snippet": article.get("description"),
+                "link": article.get("url"),
+                "source": article.get("source", {}).get("name")
+            })
+        
+        return results
     except Exception as e:
-        log.error("NewsAPI error: %s", e)
+        log.error(f"NewsAPI search error: {e}")
         return []
 
 def fetch_page_text(url: str, max_chars: int = 8000) -> str:
-    """Fetch and truncate raw page text"""
+    """URL에서 텍스트 추출"""
     try:
-        r = requests.get(url, timeout=15,
-                         headers={"User-Agent": "Mozilla/5.0 (AI Lawsuit Monitor)"})
-        r.raise_for_status()
-        from html.parser import HTMLParser
-        class _P(HTMLParser):
-            def __init__(self):
-                super().__init__()
-                self.texts = []
-            def handle_data(self, d):
-                if d.strip():
-                    self.texts.append(d.strip())
-        p = _P()
-        p.feed(r.text)
-        return " ".join(p.texts)[:max_chars]
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return response.text[:max_chars]
     except Exception as e:
-        log.debug("fetch_page_text(%s): %s", url, e)
+        log.warning(f"Failed to fetch {url}: {e}")
         return ""
 
-# ─── Claude Analysis ─────────────────────────────────────────────────────────
-
-DISCOVERY_SYSTEM = """당신은 AI 학습데이터 관련 소송을 전문으로 분석하는 법률 인텔리전스 에이전트입니다.
-주어진 검색 결과에서 AI 학습데이터(training data)와 직접 관련된 소송 사건을 식별하고,
-각 소송의 핵심 정보를 추출하세요. 반드시 JSON 형식만 출력하세요.
-"""
+# ==================== Claude 분석 ====================
 
 def claude_analyze_snippets(snippets: list[dict], full_texts: dict) -> list[dict]:
     """Claude로 검색결과에서 소송 식별 및 정보 추출"""
-    combined = ""
-    for i, s in enumerate(snippets[:30]):
-        full = full_texts.get(s["url"], "")
-        combined += f"\n\n--- Result {i+1} ---\nTitle: {s['title']}\nURL: {s['url']}\nDate: {s.get('date','')}\nSnippet: {s['snippet']}\n"
-        if full:
-            combined += f"Page text: {full[:3000]}\n"
-
-    prompt = f"""다음 검색 결과에서 AI 학습데이터(training data) 관련 소송을 식별하세요.
-
-{combined}
-
-각 소송에 대해 아래 JSON 배열을 반환하세요. 소송이 없으면 빈 배열 [] 반환.
-반드시 순수 JSON만, Markdown 코드블록 없이 출력:
-
-[
-  {{
-    "case_name": "사건명 (예: Authors Guild v. OpenAI)",
-    "plaintiff": "원고 (개인/단체명)",
-    "defendant": "피고 (기업/개인)",
-    "country": "국가 (US/KR/JP/CN/DE/FR/GB/EU/etc.)",
-    "jurisdiction": "관할 (예: N.D. Cal., Seoul Central District Court)",
-    "court": "법원명",
-    "case_number": "사건번호 (있는 경우)",
-    "filed_date": "제소일 (YYYY-MM-DD, 불명확시 추정 표시)",
-    "subject_data": "소송 대상 데이터 (예: Common Crawl, GitHub Code, 뉴스기사 등)",
-    "claims": "소송 원인/청구 (예: 저작권 침해, 부정경쟁행위, GDPR 위반 등)",
-    "summary": "사건 요약 2~3문장 (한국어)",
-    "source_urls": ["관련 URL 1", "관련 URL 2"],
-    "is_new": true,
-    "confidence": "high/medium/low"
-  }}
-]
-"""
     try:
-        msg = client.messages.create(
+        client = Anthropic(api_key=ANTHROPIC_API_KEY)
+        
+        # 스니펫 형식화
+        snippets_text = "\n".join([
+            f"- {s['title']}\n  {s['snippet']}\n  Source: {s['source']}\n  URL: {s['link']}"
+            for s in snippets[:20]
+        ])
+        
+        prompt = f"""당신은 AI 학습데이터와 관련된 소송을 식별하는 법률 분석가입니다.
+
+다음 뉴스 스니펫들을 분석하여, AI 학습데이터/저작권과 관련된 소송을 식별하세요.
+
+스니펫:
+{snippets_text}
+
+각 소송에 대해 JSON 형식으로 다음 정보를 추출하세요:
+{{
+    "lawsuits": [
+        {{
+            "case_name": "사건명",
+            "plaintiff": "원고",
+            "defendant": "피고",
+            "country": "국가",
+            "jurisdiction": "관할권",
+            "filed_date": "제소일 (YYYY-MM-DD)",
+            "subject_data": "대상 데이터 (예: 저작권 있는 책, 뉴스기사)",
+            "claims": "주요 청구 (예: 저작권 침해, GDPR 위반)",
+            "summary": "소송 요약 (한두 문장)",
+            "confidence": "신뢰도 (high/medium/low)"
+        }}
+    ]
+}}
+
+JSON만 응답하세요."""
+        
+        message = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=4000,
-            system=DISCOVERY_SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": prompt}]
         )
-        raw = msg.content[0].text.strip()
-        # Strip markdown fences if present
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        return json.loads(raw)
+        
+        try:
+            response_text = message.content[0].text
+            # JSON 추출
+            import re
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group())
+                return data.get("lawsuits", [])
+        except:
+            log.warning("Failed to parse Claude response as JSON")
+            return []
+        
+        return []
     except Exception as e:
-        log.error("Claude analyze error: %s", e)
+        log.error(f"Claude analysis error: {e}")
         return []
 
-UPDATE_SYSTEM = """당신은 AI 소송 진행 상황을 추적하는 전문 에이전트입니다.
-기존 소송에 대한 새로운 업데이트(판결, 합의, 기각, 항소 등)를 식별하세요. 반드시 JSON만 출력.
-"""
-
-def claude_analyze_update(lawsuit: dict, snippets: list[dict]) -> dict | None:
-    """기존 소송의 업데이트 식별"""
-    if not snippets:
-        return None
-    combined = "\n".join(
-        f"[{s.get('date','')}] {s['title']}\n{s['snippet']}\n{s['url']}"
-        for s in snippets[:10]
-    )
-    prompt = f"""기존 소송 정보:
-Case: {lawsuit.get('case_name')}
-Plaintiff: {lawsuit.get('plaintiff')}
-Defendant: {lawsuit.get('defendant')}
-Status: {lawsuit.get('status')}
-
-검색 결과:
-{combined}
-
-이 소송의 새로운 진행 상황이 있으면 JSON으로 반환, 없으면 null:
-{{
-  "update_type": "판결/합의/기각/항소/증거제출/공판기일/기타",
-  "description": "업데이트 내용 (한국어, 2~3문장)",
-  "new_status": "active/settled/dismissed/appealed/closed",
-  "source_url": "출처 URL",
-  "is_significant": true/false
-}}
-"""
+def claude_analyze_update(lawsuit_case: dict) -> Optional[dict]:
+    """기존 소송의 업데이트 확인"""
     try:
-        msg = client.messages.create(
+        client = Anthropic(api_key=ANTHROPIC_API_KEY)
+        
+        prompt = f"""다음 소송에 대한 최신 뉴스를 검색하고 업데이트를 식별하세요:
+
+사건명: {lawsuit_case['case_name']}
+원고: {lawsuit_case['plaintiff']}
+피고: {lawsuit_case['defendant']}
+
+최신 상태를 JSON으로 반환:
+{{
+    "has_update": true/false,
+    "update_type": "판결/합의/기각/항소/기타",
+    "description": "업데이트 설명",
+    "new_status": "active/settled/dismissed/appealed/closed"
+}}
+
+JSON만 응답하세요."""
+        
+        message = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=1000,
-            system=UPDATE_SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": prompt}]
         )
-        raw = msg.content[0].text.strip()
-        if raw.lower() == "null" or not raw:
-            return None
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        return json.loads(raw)
+        
+        try:
+            response_text = message.content[0].text
+            import re
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+        except:
+            pass
+        
+        return None
     except Exception as e:
-        log.error("Claude update error: %s", e)
+        log.error(f"Claude update analysis error: {e}")
         return None
 
-# ─── Deduplication ───────────────────────────────────────────────────────────
+# ==================== ID 생성 ====================
 
-def make_lawsuit_id(lawsuit: dict) -> str:
-    key = f"{lawsuit.get('plaintiff','').lower().strip()}-{lawsuit.get('defendant','').lower().strip()}-{lawsuit.get('country','').lower()}"
-    return hashlib.md5(key.encode()).hexdigest()[:12]
+def make_lawsuit_id(plaintiff: str, defendant: str, country: str) -> str:
+    """소송 고유 ID 생성"""
+    import hashlib
+    key = f"{plaintiff}_{defendant}_{country}".lower()
+    return hashlib.md5(key.encode()).hexdigest()
 
-# ─── Notifications ───────────────────────────────────────────────────────────
-
-def send_email(subject: str, html_body: str):
-    if not EMAIL_FROM or not EMAIL_TO:
-        log.warning("Email config missing – skipping email")
-        return
-    recipients = [e.strip() for e in EMAIL_TO.split(",")]
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = EMAIL_FROM
-    msg["To"]      = ", ".join(recipients)
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as srv:
-            srv.login(EMAIL_FROM, EMAIL_PASSWORD)
-            srv.sendmail(EMAIL_FROM, recipients, msg.as_string())
-        log.info("Email sent: %s", subject)
-    except Exception as e:
-        log.error("Email error: %s", e)
-
-def send_telegram(text: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram config missing – skipping")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text,
-               "parse_mode": "HTML", "disable_web_page_preview": False}
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        r.raise_for_status()
-        log.info("Telegram sent")
-    except Exception as e:
-        log.error("Telegram error: %s", e)
+# ==================== 알림 ====================
 
 def notify_new_lawsuit(lawsuit: dict):
-    flag = {"US":"🇺🇸","KR":"🇰🇷","JP":"🇯🇵","CN":"🇨🇳","DE":"🇩🇪",
-            "FR":"🇫🇷","GB":"🇬🇧","EU":"🇪🇺"}.get(lawsuit.get("country",""), "🌐")
-    urls = lawsuit.get("source_urls", [])
-    links_html = "".join(f'<li><a href="{u}">{u}</a></li>' for u in urls)
-    links_tg   = "\n".join(f'• <a href="{u}">{u[:80]}</a>' for u in urls[:3])
+    """신규 소송 알림"""
+    # 이메일 알림
+    if EMAIL_FROM and EMAIL_PASSWORD and EMAIL_TO:
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = f"⚖️ 신규 AI 학습데이터 소송 감지: {lawsuit['case_name']}"
+            msg["From"] = EMAIL_FROM
+            msg["To"] = EMAIL_TO
+            
+            html = f"""
+            <html>
+                <body>
+                    <h2>⚖️ 신규 AI 학습데이터 소송 감지</h2>
+                    <table border="1" cellpadding="10">
+                        <tr><td><b>사건명</b></td><td>{lawsuit.get('case_name', 'N/A')}</td></tr>
+                        <tr><td><b>원고</b></td><td>{lawsuit.get('plaintiff', 'N/A')}</td></tr>
+                        <tr><td><b>피고</b></td><td>{lawsuit.get('defendant', 'N/A')}</td></tr>
+                        <tr><td><b>법원</b></td><td>{lawsuit.get('jurisdiction', 'N/A')}</td></tr>
+                        <tr><td><b>제소일</b></td><td>{lawsuit.get('filed_date', 'N/A')}</td></tr>
+                        <tr><td><b>대상 데이터</b></td><td>{lawsuit.get('subject_data', 'N/A')}</td></tr>
+                        <tr><td><b>소송 원인</b></td><td>{lawsuit.get('claims', 'N/A')}</td></tr>
+                        <tr><td><b>요약</b></td><td>{lawsuit.get('summary', 'N/A')}</td></tr>
+                    </table>
+                    <p>출처: {lawsuit.get('source_urls', 'N/A')}</p>
+                </body>
+            </html>
+            """
+            msg.attach(MIMEText(html, "html"))
+            
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+                server.login(EMAIL_FROM, EMAIL_PASSWORD)
+                server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+            log.info(f"✉️ Email sent for: {lawsuit['case_name']}")
+        except Exception as e:
+            log.error(f"Email notification error: {e}")
+    
+    # 텔레그램 알림
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            text = f"""
+⚖️ 신규 AI 학습데이터 소송 감지
 
-    html = f"""
-<html><body style="font-family:sans-serif;max-width:700px;margin:auto">
-<h2 style="color:#c0392b">⚖️ 신규 AI 학습데이터 소송 감지 {flag}</h2>
-<table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse;width:100%">
-  <tr><td width="150"><b>사건명</b></td><td>{lawsuit.get('case_name','')}</td></tr>
-  <tr><td><b>원고</b></td><td>{lawsuit.get('plaintiff','')}</td></tr>
-  <tr><td><b>피고</b></td><td>{lawsuit.get('defendant','')}</td></tr>
-  <tr><td><b>관할/법원</b></td><td>{lawsuit.get('court','')} ({lawsuit.get('jurisdiction','')})</td></tr>
-  <tr><td><b>국가</b></td><td>{flag} {lawsuit.get('country','')}</td></tr>
-  <tr><td><b>제소일</b></td><td>{lawsuit.get('filed_date','')}</td></tr>
-  <tr><td><b>대상 데이터</b></td><td>{lawsuit.get('subject_data','')}</td></tr>
-  <tr><td><b>소송 원인</b></td><td>{lawsuit.get('claims','')}</td></tr>
-  <tr><td><b>요약</b></td><td>{lawsuit.get('summary','')}</td></tr>
-  <tr><td><b>출처</b></td><td><ul>{links_html}</ul></td></tr>
-</table>
-<p style="color:#7f8c8d;font-size:12px">AI Lawsuit Monitor • {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
-</body></html>"""
+사건명: {lawsuit.get('case_name', 'N/A')}
+원고: {lawsuit.get('plaintiff', 'N/A')}
+피고: {lawsuit.get('defendant', 'N/A')}
+법원: {lawsuit.get('jurisdiction', 'N/A')}
+제소일: {lawsuit.get('filed_date', 'N/A')}
 
-    tg = f"""⚖️ <b>신규 AI 학습데이터 소송</b> {flag}
+📝 요약: {lawsuit.get('summary', 'N/A')}
+            """
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+            log.info(f"📱 Telegram sent for: {lawsuit['case_name']}")
+        except Exception as e:
+            log.error(f"Telegram notification error: {e}")
 
-<b>사건:</b> {lawsuit.get('case_name','')}
-<b>원고:</b> {lawsuit.get('plaintiff','')}
-<b>피고:</b> {lawsuit.get('defendant','')}
-<b>법원:</b> {lawsuit.get('court','')}
-<b>국가:</b> {lawsuit.get('country','')}
-<b>제소일:</b> {lawsuit.get('filed_date','')}
-<b>대상 데이터:</b> {lawsuit.get('subject_data','')}
-<b>소송 원인:</b> {lawsuit.get('claims','')}
-
-📝 {lawsuit.get('summary','')}
-
-🔗 출처:
-{links_tg}"""
-
-    send_email(f"[AI소송] 신규 감지: {lawsuit.get('case_name','')}", html)
-    send_telegram(tg)
-
-def notify_update(lawsuit: dict, update: dict):
-    flag = {"US":"🇺🇸","KR":"🇰🇷","JP":"🇯🇵","CN":"🇨🇳","DE":"🇩🇪",
-            "FR":"🇫🇷","GB":"🇬🇧","EU":"🇪🇺"}.get(lawsuit.get("country",""), "🌐")
-    html = f"""
-<html><body style="font-family:sans-serif;max-width:700px;margin:auto">
-<h2 style="color:#2980b9">🔄 소송 업데이트 {flag}</h2>
-<table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse;width:100%">
-  <tr><td width="150"><b>사건명</b></td><td>{lawsuit.get('case_name','')}</td></tr>
-  <tr><td><b>업데이트 유형</b></td><td>{update.get('update_type','')}</td></tr>
-  <tr><td><b>내용</b></td><td>{update.get('description','')}</td></tr>
-  <tr><td><b>새 상태</b></td><td>{update.get('new_status','')}</td></tr>
-  <tr><td><b>출처</b></td><td><a href="{update.get('source_url','')}">링크</a></td></tr>
-</table>
-<p style="color:#7f8c8d;font-size:12px">AI Lawsuit Monitor • {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
-</body></html>"""
-
-    tg = f"""🔄 <b>소송 업데이트</b> {flag}
-
-<b>사건:</b> {lawsuit.get('case_name','')}
-<b>유형:</b> {update.get('update_type','')}
-<b>내용:</b> {update.get('description','')}
-<b>상태:</b> {update.get('new_status','')}
-🔗 <a href="{update.get('source_url','')}">출처</a>"""
-
-    send_email(f"[AI소송] 업데이트: {lawsuit.get('case_name','')}", html)
-    send_telegram(tg)
-
-# ─── Core Jobs ───────────────────────────────────────────────────────────────
-
-def job_discover():
-    """신규 소송 탐색 (하루 2회)"""
-    log.info("=== DISCOVERY JOB START ===")
-    all_snippets: list[dict] = []
-
-    for query in DISCOVERY_QUERIES:
-        results = serper_search(query, num=10, search_type="news")
-        if not results:
-            results = serper_search(query, num=10, search_type="search")
-        results += newsapi_search(query, days_back=4)
-        all_snippets.extend(results)
-        log.info("Query '%s' → %d results", query[:50], len(results))
-
-    # Deduplicate by URL
-    seen_urls = set()
-    unique = []
-    for s in all_snippets:
-        if s["url"] not in seen_urls:
-            seen_urls.add(s["url"])
-            unique.append(s)
-    log.info("Total unique snippets: %d", len(unique))
-
-    # Fetch full text for top candidates
-    full_texts = {}
-    for s in unique[:20]:
-        if any(kw in (s["title"]+s["snippet"]).lower()
-               for kw in ["lawsuit","suit","complaint","litigation","소송","訴訟","诉讼","klage","procès"]):
-            full_texts[s["url"]] = fetch_page_text(s["url"])
-
-    # Claude analysis
-    lawsuits = claude_analyze_snippets(unique, full_texts)
-    log.info("Claude identified %d lawsuits", len(lawsuits))
-
-    new_count = 0
-    for l in lawsuits:
-        if l.get("confidence") == "low":
-            continue
-        l["id"] = make_lawsuit_id(l)
-        l["discovered_at"] = datetime.now().isoformat()
-        if not lawsuit_exists(l["id"]):
-            save_lawsuit(l)
-            notify_new_lawsuit(l)
-            new_count += 1
-            log.info("NEW lawsuit saved: %s", l.get("case_name"))
-        else:
-            log.debug("Already known: %s", l.get("case_name"))
-
-    log.info("=== DISCOVERY DONE — %d new lawsuits ===", new_count)
-
-def job_track_updates():
-    """기존 소송 업데이트 추적 (하루 2회)"""
-    log.info("=== UPDATE TRACKING JOB START ===")
-    active = get_active_lawsuits()
-    log.info("Tracking %d active lawsuits", len(active))
-
-    for lawsuit in active:
-        queries = [
-            f'"{lawsuit["case_name"]}" ruling decision settlement',
-            f'{lawsuit.get("plaintiff","")} v {lawsuit.get("defendant","")} lawsuit update',
-        ]
-        snippets = []
-        for q in queries:
-            snippets += serper_search(q, num=5, search_type="news")
-            snippets += newsapi_search(q, days_back=4)
-
-        update = claude_analyze_update(lawsuit, snippets)
-        if update and update.get("is_significant"):
-            save_update(lawsuit["id"], update["update_type"],
-                        update["description"], update.get("source_url",""))
-            # Update status if changed
-            if update.get("new_status") and update["new_status"] != lawsuit["status"]:
-                conn = sqlite3.connect(DB_PATH)
-                conn.execute("UPDATE lawsuits SET status=? WHERE id=?",
-                             (update["new_status"], lawsuit["id"]))
-                conn.commit()
-                conn.close()
-            notify_update(lawsuit, update)
-            log.info("Update saved for: %s", lawsuit["case_name"])
-
-    log.info("=== UPDATE TRACKING DONE ===")
+# ==================== 주 작업 ====================
 
 def run_all():
-    job_discover()
-    job_track_updates()
+    """신규 소송 탐지 + 기존 소송 추적"""
+    log.info("=" * 60)
+    log.info("🔍 AI Lawsuit Monitor - Full Run Started")
+    log.info("=" * 60)
+    
+    # 1. 신규 소송 탐지
+    log.info("")
+    log.info("=" * 60)
+    log.info("🌐 DISCOVERY JOB START - Searching for new lawsuits")
+    log.info("=" * 60)
+    
+    all_snippets = []
+    
+    for query in DISCOVERY_QUERIES[:15]:  # 처음 15개 쿼리만 사용 (API 한도)
+        log.info(f"🔎 Querying: {query}")
+        
+        serper_results = serper_search(query, max_results=5)
+        newsapi_results = newsapi_search(query, max_results=5)
+        
+        all_snippets.extend(serper_results)
+        all_snippets.extend(newsapi_results)
+    
+    log.info(f"📊 Total snippets collected: {len(all_snippets)}")
+    
+    # Claude 분석
+    log.info("🤖 Claude analyzing snippets...")
+    lawsuits = claude_analyze_snippets(all_snippets, {})
+    log.info(f"✅ Claude identified {len(lawsuits)} potential lawsuits")
+    
+    # DB 저장
+    new_count = 0
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    for lawsuit in lawsuits:
+        lawsuit_id = make_lawsuit_id(
+            lawsuit.get('plaintiff', ''),
+            lawsuit.get('defendant', ''),
+            lawsuit.get('country', '')
+        )
+        
+        # 중복 확인
+        c.execute("SELECT id FROM lawsuits WHERE id = ?", (lawsuit_id,))
+        if not c.fetchone():
+            c.execute("""
+                INSERT INTO lawsuits 
+                (id, case_name, plaintiff, defendant, country, jurisdiction, 
+                 filed_date, subject_data, claims, summary, status, discovered_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            """, (
+                lawsuit_id,
+                lawsuit.get('case_name', ''),
+                lawsuit.get('plaintiff', ''),
+                lawsuit.get('defendant', ''),
+                lawsuit.get('country', ''),
+                lawsuit.get('jurisdiction', ''),
+                lawsuit.get('filed_date', ''),
+                lawsuit.get('subject_data', ''),
+                lawsuit.get('claims', ''),
+                lawsuit.get('summary', ''),
+                'active'
+            ))
+            new_count += 1
+            
+            # 알림
+            notify_new_lawsuit(lawsuit)
+            log.info(f"💾 New lawsuit saved: {lawsuit.get('case_name')}")
+    
+    conn.commit()
+    log.info(f"🎯 DISCOVERY DONE - {new_count} new lawsuits saved")
+    
+    # 2. 기존 소송 추적
+    log.info("")
+    log.info("=" * 60)
+    log.info("📋 UPDATE TRACKING JOB START")
+    log.info("=" * 60)
+    
+    c.execute("SELECT * FROM lawsuits WHERE status = 'active'")
+    active_lawsuits = c.fetchall()
+    
+    update_count = 0
+    for lawsuit_row in active_lawsuits[:10]:  # 최대 10개만 추적
+        lawsuit = {
+            'case_name': lawsuit_row[1],
+            'plaintiff': lawsuit_row[2],
+            'defendant': lawsuit_row[3],
+            'country': lawsuit_row[4]
+        }
+        
+        update = claude_analyze_update(lawsuit)
+        if update and update.get('has_update'):
+            c.execute("""
+                INSERT INTO updates 
+                (lawsuit_id, update_type, description, updated_at)
+                VALUES (?, ?, ?, datetime('now'))
+            """, (
+                lawsuit_row[0],
+                update.get('update_type', ''),
+                update.get('description', '')
+            ))
+            
+            c.execute("""
+                UPDATE lawsuits 
+                SET status = ?, last_updated = datetime('now')
+                WHERE id = ?
+            """, (update.get('new_status', 'active'), lawsuit_row[0]))
+            
+            update_count += 1
+            log.info(f"📌 Update recorded: {lawsuit['case_name']} - {update.get('update_type')}")
+    
+    conn.commit()
+    conn.close()
+    
+    log.info(f"✅ UPDATE TRACKING DONE - {update_count} updates recorded")
+    log.info("=" * 60)
+    log.info("🎉 AI Lawsuit Monitor - Full Run Completed Successfully!")
+    log.info("=" * 60)
+    log.info("")
 
-# ─── Scheduler ───────────────────────────────────────────────────────────────
+# ==================== 스케줄러 ====================
 
 def main():
+    """메인 함수 - 스케줄러 시작"""
+    log.info("")
+    log.info("╔" + "=" * 58 + "╗")
+    log.info("║" + " " * 58 + "║")
+    log.info("║" + "  🚀 AI Lawsuit Monitor Starting Up...".ljust(58) + "║")
+    log.info("║" + " " * 58 + "║")
+    log.info("╚" + "=" * 58 + "╝")
+    log.info("")
+    
+    # 데이터베이스 초기화
     init_db()
-    log.info("AI Lawsuit Monitor started")
-    log.info("Schedule: 08:00 and 20:00 KST daily")
-
-    # 즉시 1회 실행 (선택)
-    if os.getenv("RUN_NOW", "false").lower() == "true":
+    log.info("✅ Database initialized")
+    log.info("")
+    
+    # 배포 시 즉시 첫 실행 (진행상황 확인용)
+    if os.getenv("RUN_NOW") == "true" or os.getenv("FIRST_RUN") == "true":
+        log.info("🔄 FIRST RUN DETECTED - Running immediately for deployment check...")
+        log.info("")
         run_all()
-
-    schedule.every().day.at("23:00").do(run_all)
-    schedule.every().day.at("11:00").do(run_all)
-
+        log.info("✅ First run completed! System is ready.")
+        log.info("")
+    
+    # 스케줄 설정 (UTC 기준)
+    # ⚠️ Render 서버는 UTC 시간대를 사용합니다
+    # KST 08:00 = UTC 23:00 (전날 밤 11시)
+    # KST 20:00 = UTC 11:00 (정오)
+    log.info("🌍 Timezone Configuration:")
+    log.info("   Render server uses UTC timezone")
+    log.info("   KST 08:00 = UTC 23:00 (previous day, 11 PM)")
+    log.info("   KST 20:00 = UTC 11:00 (11 AM)")
+    log.info("")
+    
+    schedule.every().day.at("23:00").do(run_all)  # KST 08:00
+    schedule.every().day.at("11:00").do(run_all)  # KST 20:00
+    
+    log.info("📅 Scheduled Runs:")
+    log.info("   ⏰ Every day at 23:00 UTC → KST 08:00 (morning)")
+    log.info("   ⏰ Every day at 11:00 UTC → KST 20:00 (evening)")
+    log.info("")
+    log.info("⏳ Scheduler ready. Waiting for scheduled times...")
+    log.info("")
+    
+    # 스케줄러 실행
     while True:
         schedule.run_pending()
         time.sleep(60)
