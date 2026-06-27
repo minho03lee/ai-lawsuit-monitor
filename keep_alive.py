@@ -54,6 +54,8 @@ def health_detailed():
 
 def run_monitor_job():
     """monitor.py의 run_all() 함수 호출"""
+    global last_run
+    
     try:
         log.info("🔔 Scheduled job triggered!")
         
@@ -64,12 +66,10 @@ def run_monitor_job():
         run_all()
         
         # 마지막 실행 시간 기록
-        global last_run
         last_run = {"timestamp": datetime.now().isoformat(), "status": "success"}
         
     except Exception as e:
         log.error(f"❌ Scheduled job error: {e}", exc_info=True)
-        global last_run
         last_run = {"timestamp": datetime.now().isoformat(), "status": "error", "error": str(e)}
 
 def scheduler_thread():
