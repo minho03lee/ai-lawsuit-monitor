@@ -109,6 +109,14 @@ def main():
     log.info("╚" + "=" * 58 + "╝")
     log.info("")
     
+    # 배포 시 즉시 첫 실행 (FIRST_RUN=true 또는 RUN_NOW=true 환경변수)
+    if os.getenv("FIRST_RUN") == "true" or os.getenv("RUN_NOW") == "true":
+        log.info("🔄 FIRST RUN DETECTED - Running immediately for deployment check...")
+        log.info("")
+        run_monitor_job()
+        log.info("✅ First run completed! System is ready.")
+        log.info("")
+
     # 스케줄러 스레드 시작
     log.info("📌 Starting scheduler thread...")
     scheduler = threading.Thread(target=scheduler_thread, daemon=True)
