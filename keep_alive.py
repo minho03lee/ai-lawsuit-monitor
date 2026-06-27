@@ -109,6 +109,12 @@ def main():
     log.info("╚" + "=" * 58 + "╝")
     log.info("")
     
+    # DB 초기화 (테이블 생성) - run_all() 보다 반드시 먼저 실행
+    log.info("🗄️ Initializing database...")
+    from monitor import init_db
+    init_db()
+    log.info("")
+
     # 배포 시 즉시 첫 실행 (FIRST_RUN=true 또는 RUN_NOW=true 환경변수)
     if os.getenv("FIRST_RUN") == "true" or os.getenv("RUN_NOW") == "true":
         log.info("🔄 FIRST RUN DETECTED - Running immediately for deployment check...")
